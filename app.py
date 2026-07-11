@@ -1,8 +1,7 @@
 # ============================================================
-# app.py - Sistema de Gestão de Planos de Ação (Vercel Adaptado)
-# USO: defina DB_PATH e UPLOAD_FOLDER via variáveis de ambiente
-# AVISO: no Vercel, o sistema de arquivos é efêmero. Use
-#        banco externo (Supabase/Neon) e armazenamento em nuvem.
+# app.py - Sistema de Gestão de Planos de Ação
+# Com upload de evidências (PDF, JPEG, PNG) e visualização
+# CORREÇÃO: URL via url_for, caminhos relativos e MIME types
 # ============================================================
 
 import os
@@ -20,34 +19,16 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'chave-secreta-para-desenvolvimento')
+app.secret_key = 'chave-secreta-para-desenvolvimento'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB (suporta 10MB para imagens)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- Configurações de upload (use um serviço externo em produção) ---
-UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', os.path.join('/tmp', 'uploads'))
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
-
-# ==================== BANCO DE DADOS (PERSISTENTE VIA ENV) ====================
-# Para Vercel, defina DB_PATH para um banco externo (PostgreSQL via Supabase/Neon)
-# Exemplo: DB_PATH=postgresql://user:pass@host:5432/dbname
-# Se não definido, usará SQLite em /tmp (dados perdidos a cada deploy)
-DB_PATH = os.environ.get('DB_PATH')
-if not DB_PATH:
-    # Fallback para SQLite local (não persistente no Vercel)
-    DB_DIR = os.path.join('/tmp', 'instance')
-    os.makedirs(DB_DIR, exist_ok=True)
-    DB_PATH = os.path.join(DB_DIR, 'planos_acao.db')
-else:
-    # Se for PostgreSQL, você precisará de um driver (psycopg2-binary)
-    # e adaptar as funções de banco para usar SQLAlchemy ou psycopg2.
-    # Para simplificar, mantemos SQLite, mas você deve migrar para PostgreSQL.
-    logger.warning("PostgreSQL não implementado neste código. Usando SQLite.")
-    DB_DIR = os.path.join('/tmp', 'instance')
-    os.makedirs(DB_DIR, exist_ok=True)
-    DB_PATH = os.path.join(DB_DIR, 'planos_acao.db')
-
-logger.info(f"📂 Banco de dados em: {DB_PATH}")
+# ==================== BANCO DE DADOS ====================
+DB_DIR = os.path.join(os.path.dirname(__file__), 'instance')
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, 'planos_acao.db')
+logger.info(f"Banco de dados em: {DB_PATH}")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -133,7 +114,7 @@ def init_db():
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     
-    # --- Tabela evidencias ---
+    # --- Tabela evidencias (para upload de arquivos) ---
     c.execute('''CREATE TABLE IF NOT EXISTS evidencias (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         atividade_id INTEGER NOT NULL,
@@ -241,14 +222,11 @@ def criar_usuario(nome, email, senha, perfil='usuario', departamento='', cargo='
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (nome, email, senha_hash, perfil, departamento, cargo, data_vigencia, 1, 1))
         conn.commit()
-        conn.close()
-        return True, "Usuário criado com sucesso."
+        return True
     except sqlite3.IntegrityError:
+        return False
+    finally:
         conn.close()
-        return False, "E-mail já cadastrado."
-    except Exception as e:
-        conn.close()
-        return False, f"Erro interno: {e}"
 
 def atualizar_senha(email, nova_senha):
     conn = sqlite3.connect(DB_PATH)
@@ -510,11 +488,13 @@ def get_evidencia_by_id(evidencia_id):
     return dict(row) if row else None
 
 def salvar_evidencia(atividade_id, arquivo, usuario_nome):
+    # Valida extensão
     nome_original = arquivo.filename
     ext = nome_original.rsplit('.', 1)[-1].lower() if '.' in nome_original else ''
     if ext not in ['pdf', 'jpeg', 'png']:
         raise ValueError("Formato não permitido. Use .pdf, .jpeg ou .png.")
     
+    # Valida tamanho (10MB para imagens, PDF pode ser maior)
     arquivo.seek(0, os.SEEK_END)
     tamanho = arquivo.tell()
     arquivo.seek(0)
@@ -523,15 +503,21 @@ def salvar_evidencia(atividade_id, arquivo, usuario_nome):
     if tamanho > 16 * 1024 * 1024:
         raise ValueError("Arquivo muito grande (máximo 16MB).")
     
+    # Cria pasta para a atividade
     pasta_atividade = os.path.join(app.config['UPLOAD_FOLDER'], str(atividade_id))
     os.makedirs(pasta_atividade, exist_ok=True)
     
+    # Gera nome único para o arquivo
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     nome_arquivo = f"{timestamp}_{secure_filename(nome_original)}"
+    # Caminho relativo à pasta uploads (para facilitar a URL)
     caminho_relativo = os.path.join(str(atividade_id), nome_arquivo)
     caminho_absoluto = os.path.join(app.config['UPLOAD_FOLDER'], caminho_relativo)
+    
+    # Salva arquivo
     arquivo.save(caminho_absoluto)
     
+    # Registra no banco (armazena caminho relativo)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''INSERT INTO evidencias (atividade_id, nome_original, nome_arquivo, caminho, tipo_arquivo, tamanho, upload_por)
@@ -857,8 +843,10 @@ def admin_novo_usuario():
         perfil = request.form['perfil']
         departamento = request.form.get('departamento', '')
         cargo = request.form.get('cargo', '')
-        sucesso, mensagem = criar_usuario(nome, email, senha, perfil, departamento, cargo)
-        flash(mensagem, 'success' if sucesso else 'danger')
+        if criar_usuario(nome, email, senha, perfil, departamento, cargo):
+            flash('Usuário criado com sucesso!', 'success')
+        else:
+            flash('E-mail já cadastrado.', 'danger')
         return redirect(url_for('admin_usuarios'))
     conteudo = '''
     <div class="page-title"><i class="fas fa-user-plus"></i> Novo Usuário</div>
@@ -1289,6 +1277,7 @@ def get_wbs_atividades_completo(wbs_id):
 @app.route('/atividade/evidencias/<int:atividade_id>')
 @login_required
 def gerenciar_evidencias(atividade_id):
+    # Busca a atividade
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -1360,6 +1349,7 @@ def gerenciar_evidencias(atividade_id):
             is_image = ext in ['jpeg', 'jpg', 'png']
             tamanho = tamanho_legivel(ev['tamanho'])
             
+            # CORREÇÃO: gera URL usando url_for
             url_arquivo = url_for('uploaded_file', filename=ev['caminho'])
             
             conteudo += f'''
@@ -1444,13 +1434,16 @@ def deletar_evidencia_route(evidencia_id):
 @app.route('/uploads/<path:filename>')
 @login_required
 def uploaded_file(filename):
+    """Serve arquivos da pasta uploads com o MIME type correto"""
+    # Garante que o arquivo está dentro da pasta uploads
     safe_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     if not os.path.exists(safe_path):
         abort(404)
+    # Determina o MIME type
     mimetype, _ = mimetypes.guess_type(safe_path)
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename, mimetype=mimetype)
 
-# ==================== ROTAS DE ATIVIDADES ====================
+# ==================== ROTAS DE ATIVIDADES COM FILTROS ====================
 @app.route('/atividades')
 @login_required
 def listar_atividades():
@@ -2073,13 +2066,232 @@ def notificacoes():
     return render_template_string(LAYOUT, conteudo=conteudo)
 
 # ==================== TEMPLATES ====================
-# (mantenha os templates LOGIN_PAGE, ALTERAR_SENHA_PAGE, LAYOUT e LAYOUT_ADMIN exatamente como estão)
+LOGIN_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Planos de Ação</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #2d3748, #1a202c); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .login-card { background: white; border-radius: 1rem; padding: 2.5rem; width: 100%; max-width: 400px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .login-card h1 { font-size: 1.8rem; color: #2d3748; margin-bottom: 0.5rem; text-align: center; }
+        .login-card .subtitle { text-align: center; color: #718096; margin-bottom: 2rem; font-size: 0.9rem; }
+        .login-card .logo { text-align: center; font-size: 3rem; color: #4299e1; margin-bottom: 1rem; }
+        .form-group { margin-bottom: 1.2rem; }
+        .form-group label { display: block; font-weight: 600; color: #4a5568; margin-bottom: 0.3rem; font-size: 0.9rem; }
+        .form-control { width: 100%; padding: 0.7rem 1rem; border: 1px solid #e2e8f0; border-radius: 0.5rem; font-size: 1rem; transition: border-color 0.2s; }
+        .form-control:focus { outline: none; border-color: #4299e1; box-shadow: 0 0 0 3px rgba(66,153,225,0.15); }
+        .btn { width: 100%; padding: 0.7rem; background: #4299e1; color: white; border: none; border-radius: 0.5rem; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        .btn:hover { background: #3182ce; }
+        .alert { padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1rem; font-size: 0.9rem; }
+        .alert-danger { background: #fed7d7; color: #9b2c2c; border: 1px solid #fc8181; }
+        .alert-success { background: #c6f6d5; color: #22543d; border: 1px solid #48bb78; }
+        .alert-warning { background: #fefcbf; color: #744210; border: 1px solid #ecc94b; }
+        .mt-2 { margin-top: 1rem; }
+        .text-center { text-align: center; }
+        .text-muted { color: #718096; font-size: 0.85rem; }
+        @media (max-width: 480px) { .login-card { padding: 1.5rem; margin: 1rem; } }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo"><i class="fas fa-tasks"></i></div>
+        <h1>Gestão de Planos</h1>
+        <p class="subtitle">Acesse sua conta</p>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}{% for category, message in messages %}<div class="alert alert-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+        {% endwith %}
+        <form method="post">
+            <div class="form-group"><label><i class="fas fa-envelope"></i> E-mail</label><input type="email" name="email" class="form-control" placeholder="seu@email.com" required></div>
+            <div class="form-group"><label><i class="fas fa-lock"></i> Senha</label><input type="password" name="senha" class="form-control" placeholder="••••••••" required></div>
+            <button type="submit" class="btn"><i class="fas fa-sign-in-alt"></i> Entrar</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
+
+ALTERAR_SENHA_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alterar Senha - Planos de Ação</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #2d3748, #1a202c); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .card { background: white; border-radius: 1rem; padding: 2.5rem; width: 100%; max-width: 400px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .card h1 { font-size: 1.8rem; color: #2d3748; margin-bottom: 0.5rem; text-align: center; }
+        .card .logo { text-align: center; font-size: 3rem; color: #4299e1; margin-bottom: 1rem; }
+        .form-group { margin-bottom: 1.2rem; }
+        .form-group label { display: block; font-weight: 600; color: #4a5568; margin-bottom: 0.3rem; }
+        .form-control { width: 100%; padding: 0.7rem 1rem; border: 1px solid #e2e8f0; border-radius: 0.5rem; font-size: 1rem; }
+        .form-control:focus { outline: none; border-color: #4299e1; box-shadow: 0 0 0 3px rgba(66,153,225,0.15); }
+        .btn { width: 100%; padding: 0.7rem; background: #4299e1; color: white; border: none; border-radius: 0.5rem; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        .btn:hover { background: #3182ce; }
+        .btn-secondary { background: #718096; margin-top: 0.5rem; }
+        .btn-secondary:hover { background: #4a5568; }
+        .alert { padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1rem; font-size: 0.9rem; }
+        .alert-danger { background: #fed7d7; color: #9b2c2c; border: 1px solid #fc8181; }
+        .alert-success { background: #c6f6d5; color: #22543d; border: 1px solid #48bb78; }
+        .alert-warning { background: #fefcbf; color: #744210; border: 1px solid #ecc94b; }
+        .text-center { text-align: center; }
+        .text-muted { color: #718096; font-size: 0.85rem; margin-top: 1rem; }
+        @media (max-width: 480px) { .card { padding: 1.5rem; margin: 1rem; } }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="logo"><i class="fas fa-key"></i></div>
+        <h1>Alterar Senha</h1>
+        <p class="text-muted">Este é seu primeiro acesso. Defina uma nova senha.</p>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}{% for category, message in messages %}<div class="alert alert-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+        {% endwith %}
+        <form method="post">
+            <div class="form-group"><label>Senha Atual</label><input type="password" name="senha_atual" class="form-control" required></div>
+            <div class="form-group"><label>Nova Senha</label><input type="password" name="nova_senha" class="form-control" required></div>
+            <div class="form-group"><label>Confirmar Nova Senha</label><input type="password" name="confirmar_senha" class="form-control" required></div>
+            <button type="submit" class="btn"><i class="fas fa-save"></i> Alterar Senha</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
+
+LAYOUT = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestão de Planos de Ação</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f4f8; color: #1a202c; line-height: 1.6; }
+        .navbar { background: #2d3748; padding: 0 1rem; height: 64px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+        .navbar-brand { color: white; font-weight: 700; font-size: 1.1rem; }
+        .navbar-brand i { color: #63b3ed; margin-right: 0.5rem; }
+        .navbar-links { display: flex; gap: 1rem; list-style: none; flex-wrap: wrap; }
+        .navbar-links a { color: #cbd5e0; text-decoration: none; display: flex; align-items: center; gap: 0.2rem; font-size: 0.9rem; padding: 0.3rem 0.5rem; border-radius: 0.375rem; transition: background 0.2s; }
+        .navbar-links a:hover { background: rgba(255,255,255,0.1); color: white; }
+        .navbar-links a.active { background: rgba(99,179,237,0.2); color: white; }
+        .user-info { display: flex; align-items: center; gap: 0.8rem; color: #a0aec0; font-size:0.9rem; flex-wrap: wrap; }
+        .user-info .perfil-badge { padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.65rem; font-weight: 600; }
+        .perfil-badge.admin { background: #805ad5; color: white; }
+        .perfil-badge.master { background: #48bb78; color: white; }
+        .perfil-badge.usuario { background: #a0aec0; color: white; }
+        .user-info .logout-btn { color: #fc8181; text-decoration: none; font-size:0.85rem; display: flex; align-items: center; gap:0.3rem; }
+        .user-info .logout-btn:hover { color: #e53e3e; }
+        .container { max-width: 1280px; margin: 0 auto; padding: 1rem; }
+        .page-title { font-size: 1.5rem; font-weight: 700; margin-bottom: 1rem; color: #2d3748; }
+        .card { background: white; border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #e2e8f0; }
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 1rem; }
+        .grid-5 { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 1rem; }
+        .stat-card { background: white; border-radius: 0.75rem; padding: 1rem; border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 0.8rem; }
+        .stat-icon { width: 42px; height: 42px; border-radius: 0.75rem; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; color: white; flex-shrink: 0; }
+        .stat-icon.blue { background: #4299e1; }
+        .stat-icon.green { background: #48bb78; }
+        .stat-icon.red { background: #fc8181; }
+        .stat-icon.yellow { background: #ecc94b; }
+        .stat-icon.gray { background: #a0aec0; }
+        .stat-info h3 { font-size: 1.25rem; }
+        .stat-info p { color: #718096; font-size: 0.75rem; }
+        .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
+        .badge-admin { background: #805ad5; color: white; }
+        .badge-master { background: #48bb78; color: white; }
+        .badge-usuario { background: #a0aec0; color: white; }
+        .badge-Dentro_do_Prazo { background: #c6f6d5; color: #22543d; }
+        .badge-Fora_do_Prazo { background: #fed7d7; color: #9b2c2c; }
+        .badge-Concluído_Dentro_do_Prazo { background: #9ae6b4; color: #22543d; }
+        .badge-Concluído_Fora_do_Prazo { background: #feb2b2; color: #9b2c2c; }
+        .btn { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.4rem 0.8rem; border-radius: 0.375rem; font-weight: 600; border: none; cursor: pointer; text-decoration: none; font-size: 0.85rem; }
+        .btn-primary { background: #4299e1; color: white; }
+        .btn-success { background: #48bb78; color: white; }
+        .btn-warning { background: #ecc94b; color: #1a202c; }
+        .btn-danger { background: #fc8181; color: white; }
+        .btn-secondary { background: #718096; color: white; }
+        .btn-outline { background: transparent; color: #4a5568; border: 1px solid #e2e8f0; }
+        .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.75rem; }
+        .form-group { margin-bottom: 0.8rem; }
+        .form-group label { display: block; font-weight: 600; color: #4a5568; margin-bottom: 0.2rem; font-size: 0.9rem; }
+        .form-control { width: 100%; padding: 0.5rem 0.7rem; border: 1px solid #e2e8f0; border-radius: 0.375rem; font-size: 0.9rem; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        .form-actions { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+        .flex { display: flex; }
+        .flex-between { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+        .table-responsive { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th { background: #f7fafc; padding: 0.5rem 0.75rem; text-align: left; border-bottom: 2px solid #e2e8f0; }
+        td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #edf2f7; }
+        .empty-state { text-align: center; padding: 2rem; color: #718096; }
+        .empty-state i { font-size: 2rem; color: #cbd5e0; margin-bottom: 0.5rem; }
+        .alert { padding: 0.5rem 0.75rem; border-radius: 0.375rem; margin-bottom: 0.8rem; font-size: 0.9rem; }
+        .alert-success { background: #c6f6d5; color: #22543d; border: 1px solid #48bb78; }
+        .alert-danger { background: #fed7d7; color: #9b2c2c; border: 1px solid #fc8181; }
+        .alert-warning { background: #fefcbf; color: #744210; border: 1px solid #ecc94b; }
+        .alert-info { background: #bee3f8; color: #2a69ac; border: 1px solid #63b3ed; }
+        @media (max-width: 768px) {
+            .navbar { padding: 0.5rem 1rem; height: auto; }
+            .navbar-brand { font-size: 1rem; }
+            .navbar-links { gap: 0.3rem; }
+            .navbar-links a { font-size: 0.8rem; padding: 0.2rem 0.4rem; }
+            .container { padding: 0.75rem; }
+            .page-title { font-size: 1.25rem; }
+            .card { padding: 1rem; }
+            .form-row { grid-template-columns: 1fr; }
+            .btn { font-size: 0.8rem; padding: 0.3rem 0.6rem; }
+            table { font-size: 0.75rem; }
+            th, td { padding: 0.3rem 0.5rem; }
+            .user-info { font-size: 0.8rem; }
+            .grid-5 { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <a class="navbar-brand" href="/"><i class="fas fa-tasks"></i> Planos</a>
+        <ul class="navbar-links">
+            <li><a href="/" class="{{ 'active' if request.path == '/' else '' }}"><i class="fas fa-chart-pie"></i> Dashboard</a></li>
+            <li><a href="/atividades" class="{{ 'active' if request.path == '/atividades' else '' }}"><i class="fas fa-tasks"></i> Atividades</a></li>
+            <li><a href="/notificacoes" class="{{ 'active' if request.path == '/notificacoes' else '' }}"><i class="fas fa-bell"></i> Notificações</a></li>
+            {% if session.perfil == 'admin' %}
+            <li><a href="/admin/usuarios" class="{{ 'active' if request.path == '/admin/usuarios' else '' }}"><i class="fas fa-users"></i> Usuários</a></li>
+            <li><a href="/admin/configuracoes" class="{{ 'active' if request.path == '/admin/configuracoes' else '' }}"><i class="fas fa-cog"></i> Config</a></li>
+            {% endif %}
+        </ul>
+        <div class="user-info">
+            <i class="fas fa-user"></i> {{ session.nome }}
+            <span class="perfil-badge {{ session.perfil }}">{{ session.perfil }}</span>
+            <a href="/logout" class="logout-btn"><i class="fas fa-sign-out-alt"></i> Sair</a>
+        </div>
+    </nav>
+    <main class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}{% for category, message in messages %}<div class="alert alert-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+        {% endwith %}
+        {{ conteudo|safe }}
+    </main>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+'''
+
+LAYOUT_ADMIN = LAYOUT
 
 # ==================== INICIALIZAÇÃO ====================
 if __name__ == '__main__':
     print("🚀 Servidor iniciado em http://localhost:5000")
     print("📧 Admin: admin@empresa.com / admin123")
-    print("📂 Banco de dados em:", DB_PATH)
     print("📋 Datas formatadas em DD/MM/AAAA")
+    print("📋 Expansão de WBS com colunas alinhadas")
     print("📋 Upload de evidências: PDF, JPEG, PNG (imagens até 10MB)")
+    print("📋 Responsivo para mobile")
     app.run(debug=True, host='0.0.0.0', port=8080)
